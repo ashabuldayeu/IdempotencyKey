@@ -15,7 +15,6 @@ namespace IdempotencyKey.PersistentStorage
         {
             
             modelBuilder.ApplyConfiguration(new IdempotentRequestEntityConfigurator());
-            //modelBuilder.ApplyConfiguration(new IdempotentActionEntityConfigurator());
             base.OnModelCreating(modelBuilder);
         }
     }

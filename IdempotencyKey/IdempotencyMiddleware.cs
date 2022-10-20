@@ -21,62 +21,65 @@ namespace IdempotencyKey
             if (string.IsNullOrWhiteSpace(idempotencyHeader))
             {
                 await next(context);
+                return;
+            }
+
+            Guid idempotencyHeaderGuid;
+            if (!Guid.TryParse(idempotencyHeader, out idempotencyHeaderGuid))
+            {
+                // response just for sample
+                context.Response.ContentType = "text/plain";
+                context.Response.StatusCode = 400;
+                await context.Response.WriteAsync("X-Idempotency-Key should be a valid UUID4");
             }
             else
             {
-                Guid idempotencyHeaderGuid;
-                if (!Guid.TryParse(idempotencyHeader, out idempotencyHeaderGuid))
+                IdempotentRequest request = new IdempotentRequest(idempotencyHeaderGuid, $"{context.Request.Method}_{context.Request.Path}");
+                // if flag == created it mean that there were no such keys already stored
+                bool isCreated = await _cacheProvider.CreateAsync(request);
+
+                if (isCreated)
                 {
-                    context.Response.ContentType = "text/plain";
-                    context.Response.StatusCode = 400;
-                    await context.Response.WriteAsync("X-Idempotency-Key should be a valid UUID4");
+                    // save income request to persistent storage
+                    await _persistentStorage.AddIdempotentRequestAsync(request);
+
+                    // not need to "using" this stream under control of context.response
+                    // additional stream to allow save response body across pipeline
+                    Stream responseStream = context.Response.Body;
+                    using MemoryStream tempBodyStream = new MemoryStream();
+
+                    context.Response.Body = tempBodyStream;
+
+                    await next(context);
+
+                    tempBodyStream.Position = 0;
+
+                    // save request respnse for futher requests
+                    await _persistentStorage.SaveResponseAsync(request.Key, await RequestResponse.CreateFromHttpResponseAsync(context.Response));
+
+                    await tempBodyStream.CopyToAsync(responseStream);
+
+                    context.Response.Body = responseStream;
                 }
                 else
                 {
-                    var request = new IdempotentRequest(idempotencyHeaderGuid, $"{context.Request.Method}_{context.Request.Path}");
-                    bool isCreated = await _cacheProvider.CreateAsync(request);
-
-                    if (isCreated)
+                    var savedResponse = await _persistentStorage.GetExistedResponseAsync(request.Key);
+                    // if requests were in race condition and one marked as duplicate but first didn't finish yet we cannot return saved response
+                    // so return Accepted code
+                    if(savedResponse == null)
                     {
-                        try
-                        {
-                            await _persistentStorage.AddIdempotentRequestAsync(request);
-                            Stream str = context.Response.Body;
-                            using MemoryStream memoryStream = new MemoryStream();
-                            context.Response.Body = memoryStream;
-                            await next(context);
-                            memoryStream.Position = 0;
-                            using StreamReader streamReader = new StreamReader(memoryStream);
-                            var cont = await streamReader.ReadToEndAsync();
-                            await _persistentStorage.SaveResponseAsync(request.Key, new RequestResponse()
-                            {
-                                Body = cont,
-                                ContentLength = context.Response.ContentLength.GetValueOrDefault(),
-                                ContentType = context.Response.ContentType,
-                                StatusCode = context.Response.StatusCode
-                            });
-                            memoryStream.Position = 0;
-
-                            await memoryStream.CopyToAsync(str);
-
-                            context.Response.Body = str;
-                        }
-                        catch (Exception e)
-                        {
-
-                            throw;
-                        }
+                        context.Response.ContentType = "text/plain";
+                        context.Response.StatusCode = 201;
+                        await context.Response.WriteAsync("Request already sent.");
+                        return;
                     }
-                    else
-                    {
-                        var savedResponse = await _persistentStorage.GetExistedResponseAsync(request.Key);
-                        context.Response.ContentType = savedResponse.ContentType;
-                        context.Response.StatusCode = savedResponse.StatusCode;
-                        using MemoryStream sr = new MemoryStream(Encoding.UTF8.GetBytes(savedResponse.Body));
-                        await sr.CopyToAsync(context.Response.Body);
-                    }
+                    context.Response.ContentType = savedResponse.ContentType;
+                    context.Response.StatusCode = savedResponse.StatusCode;
+                    using MemoryStream savedBodyStream = new MemoryStream(Encoding.UTF8.GetBytes(savedResponse.Body));
+                    await savedBodyStream.CopyToAsync(context.Response.Body);
                 }
             }
         }
+
     }
 }
